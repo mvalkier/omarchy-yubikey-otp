@@ -209,11 +209,32 @@ Panel {
     var r = accounts.get(index)
     if (!r) return
     if (r.code !== "") {
-      Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(r.code) + " | wl-copy"])
+      root.copyToClipboard(r.code)
       root.copiedId = r.id
       copiedTimer.restart()
     } else if (r.touch) {
       root.requestCode(r.id)
+    }
+  }
+
+  // The code goes to wl-copy on stdin, never in the arguments: process arguments
+  // are readable by every local user through /proc for as long as the process runs.
+  // wl-copy reads until EOF, so stdin is closed right after the write.
+  function copyToClipboard(text) {
+    clipboardProc.running = false
+    clipboardProc.pending = text
+    clipboardProc.stdinEnabled = true
+    clipboardProc.running = true
+  }
+
+  Process {
+    id: clipboardProc
+    property string pending: ""
+    command: ["wl-copy"]
+    onStarted: {
+      write(pending)
+      pending = ""
+      stdinEnabled = false
     }
   }
 
