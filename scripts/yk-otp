@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""Key I/O for the YubiKey OTP bar widget.
+
+QML never talks to the key itself; everything goes through this script. Every
+message is one JSON line on stdout, so the panel can follow along line by line.
+
+    yk-otp unlock               wait for a key and a touch, then report the
+                                serial and the accounts
+    yk-otp codes SERIAL         the accounts, with the codes that need no touch
+    yk-otp code SERIAL ID_HEX   the code of one account; asks for a touch if the
+                                account requires one
+
+Why the touch goes through FIDO selection rather than OATH: selection makes the
+key blink without computing anything, works with several keys at once (the
+first one you touch wins) and can be cancelled cleanly with CTAPHID_CANCEL.
+"""
+import json
+import os
+import pathlib
+import re
+import signal
+import sys
+import threading
+import time
+
+from fido2.ctap import CtapError
+from fido2.ctap2 import Ctap2
+from ykman.device import list_all_devices
+from yubikit.core import TRANSPORT
+from yubikit.core.fido import FidoConnection
+from yubikit.core.smartcard import ApduError, SmartCardConnection
+from yubikit.management import CAPABILITY
+from yubikit.oath import OATH_TYPE, OathSession
+from yubikit.support import get_name
+
+# How long the key blinks before the panel gives up.
+TOUCH_TIMEOUT = 30
+OATH_LOCKED = "This YubiKey has an OATH password, which this plugin does not support"
+PCSC_DOWN = "The smart card service is not running; start it with: sudo systemctl enable --now pcscd.socket"
+OATH_DISABLED = "OATH is disabled over USB on this YubiKey; enable it with: ykman config usb --enable OATH"
+# Icon packs in the Aegis format (such as aegis-icons), each in its own
+# directory with a pack.json. The same format Yubico Authenticator reads.
+ICON_PACKS = pathlib.Path(
+    os.environ.get("XDG_DATA_HOME", pathlib.Path.home() / ".local/share")
+) / "yubikey-otp" / "icons"
+
+
+def emit(**fields):
+    """Progress as JSON on stdout, so the panel can follow along."""
+    print(json.dumps(fields, separators=(",", ":")), flush=True)
+
+
+class Locked(Exception):
+    pass
+
+
+def keys():
+    return [(dev, info) for dev, info in list_all_devices()]
+
+
+def find(serial):
+    for dev, info in keys():
+        if info.serial == int(serial) and dev.supports_connection(SmartCardConnection):
+            return dev, info
+    return None
+
+
+def open_oath(conn):
+    session = OathSession(conn)
+    if session.locked:
+        raise Locked()
+    return session
+
+
+def normalize(text):
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+def load_icons():
+    """{normalized issuer: absolute path} from all installed packs.
+    A broken or unreadable pack is skipped; the panel then falls back to the
+    built-in logos."""
+    icons = {}
+    for pack in sorted(ICON_PACKS.glob("*/pack.json")):
+        try:
+            data = json.loads(pack.read_text())
+        except (OSError, ValueError):
+            continue
+        for icon in data.get("icons", []):
+            file = (pack.parent / str(icon.get("filename", ""))).resolve()
+            # No paths outside the pack, and only formats QML can draw.
+            if pack.parent.resolve() not in file.parents or not file.is_file():
+                continue
+            if file.suffix.lower() not in (".svg", ".png", ".jpg", ".jpeg"):
+                continue
+            for issuer in icon.get("issuer", []):
+                icons.setdefault(normalize(str(issuer)), str(file))
+    return icons
+
+
+def find_icon(icons, issuer):
+    """An exact name first; otherwise the longest pack name contained in the
+    issuer, so "Bambu Labs" also finds "Bambu Lab". Short names don't count
+    there: "x" would occur in half of all issuers."""
+    key = normalize(issuer)
+    if not key:
+        return ""
+    if key in icons:
+        return icons[key]
+    candidates = [n for n in icons if len(n) >= 4 and n in key]
+    return icons[max(candidates, key=len)] if candidates else ""
+
+
+def rows(session):
+    out = []
+    icons = load_icons()
+    for cred, code in session.calculate_all(int(time.time())).items():
+        # HOTP has no period and so doesn't fit a ring that runs out.
+        if cred.oath_type != OATH_TYPE.TOTP:
+            continue
+        # Yubico Authenticator's convention for accounts you don't want to see.
+        if cred.name.startswith("_hidden:"):
+            continue
+        out.append({
+            "id": cred.id.hex(),
+            "issuer": cred.issuer or "",
+            "icon": find_icon(icons, cred.issuer or ""),
+            "name": cred.name,
+            "period": cred.period,
+            # From the code rather than cred.touch_required: that is None on
+            # older firmware, while a missing code always means a touch is
+            # needed.
+            "touch": code is None,
+            "code": code.value if code else "",
+            "validUntil": code.valid_to if code else 0,
+        })
+    out.sort(key=lambda r: (r["issuer"].casefold(), r["name"].casefold()))
+    return out
+
+
+def unlock():
+    stop = threading.Event()
+    state = {"expired": False, "signalled": False, "winner": None, "error": None}
+    lock = threading.Lock()
+
+    # The handler sets the flag from a thread of its own: Event.set() takes a
+    # lock, and a signal that interrupts the main thread while it already holds
+    # that lock would otherwise wait on itself.
+    def interrupt(*_):
+        state["signalled"] = True
+        threading.Thread(target=stop.set, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
+
+    reported = False
+    while not state["signalled"]:
+        candidates = [(d, i) for d, i in keys() if d.supports_connection(FidoConnection)]
+        if candidates:
+            break
+        if not reported:
+            emit(ok=False, reason="no_key")
+            reported = True
+        stop.wait(1)
+    if state["signalled"]:
+        return
+
+    emit(step="touch", keys=len(candidates))
+
+    def expire():
+        state["expired"] = True
+        stop.set()
+
+    timer = threading.Timer(TOUCH_TIMEOUT, expire)
+    timer.daemon = True
+    timer.start()
+
+    def select(dev, info):
+        try:
+            with dev.open_connection(FidoConnection) as conn:
+                Ctap2(conn).selection(event=stop)
+        except CtapError as e:
+            if e.code == CtapError.ERR.KEEPALIVE_CANCEL:
+                return
+            # The key gives up by itself before our timer runs out.
+            if e.code in (CtapError.ERR.USER_ACTION_TIMEOUT, CtapError.ERR.ACTION_TIMEOUT):
+                with lock:
+                    state["expired"] = True
+                stop.set()
+                return
+            with lock:
+                if state["error"] is None:
+                    state["error"] = e
+            return
+        except Exception as e:  # noqa: BLE001 - every error belongs in the panel
+            with lock:
+                if state["error"] is None:
+                    state["error"] = e
+            return
+        with lock:
+            if state["winner"] is None:
+                state["winner"] = (dev, info)
+        # The other keys stop blinking.
+        stop.set()
+
+    threads = [threading.Thread(target=select, args=c, daemon=True) for c in candidates]
+    for t in threads:
+        t.start()
+    # Short joins, so the signal handler can run in between.
+    while any(t.is_alive() for t in threads):
+        for t in threads:
+            t.join(0.2)
+    timer.cancel()
+
+    winner = state["winner"]
+    if winner is None:
+        if state["expired"]:
+            emit(ok=False, reason="no_touch")
+        elif state["signalled"]:
+            pass  # Stopped by the panel: no output.
+        elif state["error"] is not None:
+            emit(ok=False, reason=str(state["error"]) or type(state["error"]).__name__)
+        return
+
+    dev, info = winner
+    if not info.serial:
+        emit(ok=False, reason="Cannot read the serial number of this YubiKey")
+        return
+    if not dev.supports_connection(SmartCardConnection):
+        # Without a CCID interface, OATH is missing from the USB capabilities;
+        # if OATH is enabled but there is no smart card connection, PC/SC is
+        # missing.
+        usb = info.config.enabled_capabilities.get(TRANSPORT.USB, 0)
+        emit(ok=False, reason=PCSC_DOWN if usb & CAPABILITY.OATH else OATH_DISABLED)
+        return
+    with dev.open_connection(SmartCardConnection) as conn:
+        session = open_oath(conn)
+        emit(
+            ok=True,
+            serial=info.serial,
+            name=get_name(info, dev.pid.yubikey_type),
+            accounts=rows(session),
+        )
+
+
+def codes(serial):
+    found = find(serial)
+    if found is None:
+        emit(ok=False, reason="no_key")
+        return
+    dev, _ = found
+    with dev.open_connection(SmartCardConnection) as conn:
+        emit(ok=True, accounts=rows(open_oath(conn)))
+
+
+def code(serial, id_hex):
+    found = find(serial)
+    if found is None:
+        emit(ok=False, id=id_hex, reason="no_key")
+        return
+    dev, _ = found
+    target = bytes.fromhex(id_hex)
+    with dev.open_connection(SmartCardConnection) as conn:
+        session = open_oath(conn)
+        cred = next((c for c in session.list_credentials() if c.id == target), None)
+        if cred is None:
+            emit(ok=False, id=id_hex, reason="account not found")
+            return
+        emit(step="touch", id=id_hex)
+        try:
+            # Blocks until the touch, or until the key gives up.
+            result = session.calculate_code(cred, int(time.time()))
+        except ApduError:
+            emit(ok=False, id=id_hex, reason="no_touch")
+            return
+        emit(ok=True, id=id_hex, code=result.value, validUntil=result.valid_to)
+
+
+def main(argv):
+    if len(argv) == 1 and argv[0] == "unlock":
+        job = unlock
+    elif len(argv) == 2 and argv[0] == "codes" and argv[1].isdigit():
+        job = lambda: codes(argv[1])  # noqa: E731
+    elif len(argv) == 3 and argv[0] == "code" and argv[1].isdigit():
+        try:
+            bytes.fromhex(argv[2])
+        except ValueError:
+            job = None
+        else:
+            job = lambda: code(argv[1], argv[2])  # noqa: E731
+    else:
+        job = None
+    if job is None:
+        print("usage: yk-otp unlock | codes SERIAL | code SERIAL ID_HEX", file=sys.stderr)
+        return 2
+    try:
+        job()
+    except Locked:
+        emit(ok=False, reason=OATH_LOCKED)
+    except Exception as e:  # noqa: BLE001 - the panel shows the reason
+        emit(ok=False, reason=str(e) or type(e).__name__)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

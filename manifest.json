@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "melkweg.yubikey-otp",
+  "name": "YubiKey OTP",
+  "version": "0.1.0",
+  "author": "Martijn",
+  "description": "TOTP codes from your YubiKey in the bar, shown only after a touch.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "YubiKey OTP",
+    "description": "Shows the OTP accounts of the touched YubiKey with their codes.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

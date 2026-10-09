@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Puts this repo into Omarchy's plugin directory.
+#
+# Why copy rather than symlink: `omarchy-plugin-validate` rejects any symlink in
+# or on a plugin directory, because a copied plugin could otherwise point at
+# arbitrary files on disk once it lands in the trusted directory. The source
+# stays here; the shell runs the copy.
+#
+#   ./install            copy
+#   ./install --restart  copy and restart the shell
+#   ./install --force    copy even over a git checkout
+#
+# The shell reloads the plugin by itself once the copy is in place, but
+# imported JS files (Providers.js) and separate components such as
+# ProviderIcon.qml keep coming from the cache. After changing those, and for a
+# new plugin, --restart is needed.
+set -euo pipefail
+
+SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET="$HOME/.config/omarchy/plugins/melkweg.yubikey-otp"
+
+RESTART=0
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --restart) RESTART=1 ;;
+    --force) FORCE=1 ;;
+    *) echo "usage: ./install [--restart] [--force]" >&2; exit 2 ;;
+  esac
+done
+
+# Refuse to run over a git checkout. If the plugin was installed with
+# `omarchy plugin add`, the target is a checkout of this repo and
+# `omarchy plugin update` should do the work; an rsync over it leaves a dirty
+# working tree that will fight the next pull.
+if [[ -d "$TARGET/.git" && $FORCE -eq 0 ]]; then
+  echo "install: $TARGET is a git checkout." >&2
+  echo "  Update:        omarchy plugin update melkweg.yubikey-otp" >&2
+  echo "  Copy anyway:   ./install --force" >&2
+  exit 1
+fi
+
+mkdir -p "$TARGET"
+rsync -a --delete \
+  --exclude '.git/' --exclude 'install' --exclude '__pycache__/' \
+  "$SOURCE"/ "$TARGET"/
+
+omarchy plugin validate "$TARGET"
+echo "installed in $TARGET"
+
+if [[ $RESTART -eq 1 ]]; then
+  omarchy restart shell
+  echo "shell restarted"
+fi
