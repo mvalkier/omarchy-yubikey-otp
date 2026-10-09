@@ -81,6 +81,16 @@ Update later with:
 omarchy plugin update melkweg.yubikey-otp
 ```
 
+### Removal
+
+```bash
+omarchy plugin remove melkweg.yubikey-otp
+```
+
+The plugin keeps no state of its own. Icon packs you installed live in
+`~/.local/share/yubikey-otp/`; remove that directory too if you no longer want them.
+The packages from step 1 stay installed; other tools (such as `ykman`) may still use them.
+
 ## 🎨 Icons
 
 Out of the box, a few brands have a built-in logo and every other issuer gets a coloured
