@@ -44,6 +44,11 @@ the row, the issuer's icon blinks, touch the key, and the code appears. When its
 out, the row goes back to the click text. A missed touch shows **No touch — click again**
 in red.
 
+Clicked the wrong row? Just click the right one: it blinks too and waits its turn. The key
+cannot drop a request it is already waiting on, so the first touch gives the code of the
+row you clicked first, and the next touch gives the one you meant. Clicking the first row
+again cancels the second.
+
 `Escape` or a click outside the panel closes it. Reopening asks for a touch again.
 
 > [!NOTE]
@@ -222,6 +227,11 @@ The touch on opening goes through FIDO selection (`authenticatorSelection`), not
 That way the key blinks without computing anything, the first key you touch wins when
 several are plugged in, and stopping the process cancels the selection cleanly, so the key
 does not keep blinking.
+
+The touch for a single code is different: `calculate_code` blocks inside the OATH applet,
+and the key keeps waiting for that touch (about fifteen seconds) even after the process is
+stopped; a new request meanwhile fails with a PC/SC sharing violation. That is why the
+panel queues a second click instead of cancelling the first.
 
 </details>
 
