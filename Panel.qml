@@ -48,6 +48,9 @@ Panel {
   // The row waiting for a touch, the row whose touch failed, and the row that
   // was just copied.
   property string busyId: ""
+  // A row clicked while another one waits for its touch. The key cannot drop a
+  // pending request, so this one starts as soon as the current one ends.
+  property string queuedId: ""
   property string failedId: ""
   property string copiedId: ""
 
@@ -99,6 +102,7 @@ Panel {
     root.serial = null
     root.keyName = ""
     root.busyId = ""
+    root.queuedId = ""
     root.failedId = ""
     root.copiedId = ""
     root.errorText = ""
@@ -198,11 +202,22 @@ Panel {
   }
 
   function requestCode(id) {
-    if (codeProc.running || codesProc.running) return
+    if (codeProc.running || codesProc.running) {
+      // Clicking the waiting row again drops the queued one.
+      root.queuedId = id === root.busyId ? "" : id
+      return
+    }
     root.busyId = id
     root.failedId = ""
     codeProc.command = [root.helper, "code", String(root.serial), id]
     codeProc.running = true
+  }
+
+  function startQueued() {
+    if (root.queuedId === "" || root.phase !== "open") return
+    var id = root.queuedId
+    root.queuedId = ""
+    root.requestCode(id)
   }
 
   function clickRow(index) {
@@ -250,12 +265,16 @@ Panel {
     id: codesProc
     command: [root.helper, "codes", String(root.serial)]
     stdout: SplitParser { onRead: function (line) { root.handleCodes(line) } }
+    onRunningChanged: if (!running) root.startQueued()
   }
 
   Process {
     id: codeProc
     stdout: SplitParser { onRead: function (line) { root.handleCode(line) } }
-    onRunningChanged: if (!running) root.busyId = ""
+    onRunningChanged: if (!running) {
+      root.busyId = ""
+      root.startQueued()
+    }
   }
 
   // Runs the rings down and clears expired codes.
@@ -376,7 +395,7 @@ Panel {
               Layout.fillWidth: true
               implicitHeight: rowLine.implicitHeight
 
-              readonly property bool busy: root.busyId === model.id
+              readonly property bool busy: root.busyId === model.id || root.queuedId === model.id
               readonly property bool hasCode: model.code !== ""
               readonly property bool failed: root.failedId === model.id
               readonly property real remaining: Math.max(0, Math.min(1,
