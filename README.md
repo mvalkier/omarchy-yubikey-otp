@@ -7,6 +7,7 @@ Codes only appear after you touch the key, and vanish the moment the panel close
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Omarchy](https://img.shields.io/badge/Omarchy-plugin-8a2be2.svg)](https://omarchy.org)
+[![Omarchy plugin marketplace](https://img.shields.io/badge/marketplace-verified-2ea44f.svg)](https://omarchyplugins.com/plugin.html?id=melkweg.yubikey-otp)
 [![YubiKey](https://img.shields.io/badge/YubiKey-OATH%20TOTP-84bd00.svg)](https://www.yubico.com/)
 [![Python](https://img.shields.io/badge/python-3-3776ab.svg?logo=python&logoColor=white)](scripts/yk-otp)
 
@@ -75,6 +76,9 @@ sudo systemctl enable --now pcscd.socket
 | `wl-clipboard` | copying codes |
 
 ### 2. The plugin
+
+Listed in the [Omarchy plugin marketplace](https://omarchyplugins.com/plugin.html?id=melkweg.yubikey-otp),
+where you can also copy the install command. From a terminal:
 
 ```bash
 omarchy plugin add https://github.com/mvalkier/omarchy-yubikey-otp.git --enable
